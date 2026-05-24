@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rpi-rgb-led-matrix — console web</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>rpi-rgb-led-matrix</h1>
+    <div id="status-bar">
+      <span id="status-dot" class="dot idle"></span>
+      <span id="status-text">Aucun programme en cours</span>
+      <button id="btn-stop" type="button" disabled>Arrêter</button>
+    </div>
+  </header>
+
+  <main>
+    <aside>
+      <h2>Programmes</h2>
+      <ul id="program-list"></ul>
+    </aside>
+
+    <section id="program-pane">
+      <h2 id="program-title">Sélectionnez un programme</h2>
+      <p id="program-description"></p>
+
+      <form id="program-form">
+        <details open>
+          <summary>Options de la matrice LED</summary>
+          <div id="common-options" class="options-grid"></div>
+        </details>
+
+        <details open id="specific-section">
+          <summary>Options du programme</summary>
+          <div id="specific-options" class="options-grid"></div>
+        </details>
+
+        <div class="actions">
+          <button type="submit" id="btn-start">Lancer</button>
+          <button type="button" id="btn-build">Compiler (make)</button>
+          <button type="button" id="btn-reset">Valeurs par défaut</button>
+        </div>
+      </form>
+
+      <details>
+        <summary>Uploader un fichier (image / fonte / vidéo)</summary>
+        <form id="upload-form">
+          <input type="file" id="upload-input" multiple>
+          <button type="submit">Envoyer</button>
+          <span id="upload-status"></span>
+        </form>
+      </details>
+
+      <section id="stdin-section" hidden>
+        <h3>Entrée standard</h3>
+        <textarea id="stdin-text" rows="3"
+                  placeholder="Texte/touches envoyés sur stdin"></textarea>
+        <button type="button" id="btn-stdin-send">Envoyer sur stdin</button>
+      </section>
+
+      <section id="log-section">
+        <h3>Sortie du programme</h3>
+        <pre id="log"></pre>
+      </section>
+    </section>
+  </main>
+</body>
+</html>
