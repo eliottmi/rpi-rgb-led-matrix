@@ -4,13 +4,10 @@
 Usage:
     python3 webserver/server.py [--host 0.0.0.0] [--port 8080] [--no-sudo]
 
-The server runs entirely on the Python standard library. It serves a single
-page that exposes a form for each example/utility in the repository.
-Submitting a form spawns the binary; output (stdout+stderr) is captured and
-streamed back to the browser. Only one program may run at a time.
+The server runs on the Python standard library only and is written to work
+with Python >= 3.5 (no f-strings, no PEP-604 unions, no PEP-526 variable
+annotations, no ThreadingHTTPServer).
 """
-
-from __future__ import annotations
 
 import argparse
 import json
@@ -24,8 +21,12 @@ import sys
 import threading
 import time
 from collections import deque
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote
+from http.server import BaseHTTPRequestHandler, HTTPServer
+try:
+    from socketserver import ThreadingMixIn
+except ImportError:  # Python 2 fallback name (unused, but defensive)
+    from SocketServer import ThreadingMixIn  # type: ignore
+from urllib.parse import urlparse, parse_qs
 
 REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -36,36 +37,43 @@ UPLOAD_DIR = os.path.join(WEB_ROOT, "uploads")
 sys.path.insert(0, WEB_ROOT)
 from programs import PROGRAMS, LED_MATRIX_OPTIONS, get_program  # noqa: E402
 
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Multi-threaded HTTP server (replaces Python 3.7+ stdlib class)."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 # --- Process manager -------------------------------------------------------
 
 
-class Runner:
+class Runner(object):
     """Single-process LED matrix program runner."""
 
     LOG_LINES = 2000
 
-    def __init__(self, use_sudo: bool = True):
+    def __init__(self, use_sudo=True):
         # RLock so we can call _append_log (which acquires the condition
         # built on this lock) while we already hold the lock in start().
         self._lock = threading.RLock()
-        self._proc: subprocess.Popen | None = None
-        self._program_id: str | None = None
-        self._argv: list[str] = []
-        self._started_at: float = 0
-        self._log: deque[str] = deque(maxlen=self.LOG_LINES)
+        self._proc = None
+        self._program_id = None
+        self._argv = []
+        self._started_at = 0
+        self._log = deque(maxlen=self.LOG_LINES)
         self._log_seq = 0
         self._log_cond = threading.Condition(self._lock)
         self._use_sudo = use_sudo
-        self._reader_thread: threading.Thread | None = None
+        self._reader_thread = None
 
     # ---- log helpers ----
-    def _append_log(self, line: str) -> None:
+    def _append_log(self, line):
         with self._log_cond:
             self._log.append(line.rstrip("\n"))
             self._log_seq += 1
             self._log_cond.notify_all()
 
-    def get_log_since(self, since: int) -> tuple[int, list[str]]:
+    def get_log_since(self, since):
         with self._log_cond:
             total = self._log_seq
             start = max(0, total - len(self._log))
@@ -76,7 +84,7 @@ class Runner:
             return total, lines
 
     # ---- status ----
-    def status(self) -> dict:
+    def status(self):
         with self._lock:
             running = self._proc is not None and self._proc.poll() is None
             exit_code = None
@@ -92,17 +100,20 @@ class Runner:
             }
 
     # ---- start / stop ----
-    def start(self, program: dict, argv: list[str],
-              stdin_text: str | None = None,
-              env: dict | None = None) -> dict:
+    def start(self, program, argv, stdin_text=None, env=None):
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
-                return {"ok": False, "error": "Un programme est déjà en cours d'exécution. Arrêtez-le d'abord."}
-            cmd: list[str] = []
+                return {
+                    "ok": False,
+                    "error": ("Un programme est deja en cours d'execution. "
+                              "Arretez-le d'abord."),
+                }
+            cmd = []
             if self._use_sudo and program.get("needs_root", False):
                 if shutil.which("sudo") is None:
                     return {"ok": False,
-                            "error": "sudo introuvable. Lancez le serveur en root ou avec --no-sudo."}
+                            "error": ("sudo introuvable. Lancez le serveur "
+                                      "en root ou avec --no-sudo.")}
                 cmd.append("sudo")
                 cmd.append("-n")
             cmd.extend(argv)
@@ -110,26 +121,30 @@ class Runner:
                 proc = subprocess.Popen(
                     cmd,
                     cwd=REPO_ROOT,
-                    stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                    stdin=(subprocess.PIPE if stdin_text is not None
+                           else subprocess.DEVNULL),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    env={**os.environ, **(env or {})},
+                    env=dict(os.environ, **(env or {})),
                     start_new_session=True,
                     bufsize=1,
                     universal_newlines=True,
                 )
             except FileNotFoundError as e:
                 return {"ok": False,
-                        "error": f"Binaire introuvable: {e}. Avez-vous compilé l'exemple ?"}
+                        "error": ("Binaire introuvable: {0}. "
+                                  "Avez-vous compile l'exemple ?").format(e)}
             except PermissionError as e:
-                return {"ok": False, "error": f"Permission refusée: {e}"}
+                return {"ok": False,
+                        "error": "Permission refusee: {0}".format(e)}
             self._proc = proc
             self._program_id = program["id"]
             self._argv = cmd
             self._started_at = time.time()
             self._log.clear()
             self._log_seq = 0
-            self._append_log(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+            self._append_log(
+                "$ " + " ".join(shlex.quote(c) for c in cmd))
             if stdin_text is not None and proc.stdin is not None:
                 try:
                     proc.stdin.write(stdin_text)
@@ -139,26 +154,27 @@ class Runner:
                 except (BrokenPipeError, OSError):
                     pass
             self._reader_thread = threading.Thread(
-                target=self._read_loop, args=(proc,), daemon=True)
+                target=self._read_loop, args=(proc,))
+            self._reader_thread.daemon = True
             self._reader_thread.start()
             return {"ok": True}
 
-    def _read_loop(self, proc: subprocess.Popen) -> None:
+    def _read_loop(self, proc):
         try:
-            assert proc.stdout is not None
             for line in proc.stdout:
                 self._append_log(line)
         except Exception as e:
-            self._append_log(f"[reader error: {e}]")
+            self._append_log("[reader error: {0}]".format(e))
         rc = proc.wait()
-        self._append_log(f"[process exited with code {rc}]")
+        self._append_log("[process exited with code {0}]".format(rc))
 
-    def send_stdin(self, text: str) -> dict:
+    def send_stdin(self, text):
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 return {"ok": False, "error": "Aucun processus en cours."}
             if self._proc.stdin is None:
-                return {"ok": False, "error": "Le processus n'a pas de stdin."}
+                return {"ok": False,
+                        "error": "Le processus n'a pas de stdin."}
             try:
                 self._proc.stdin.write(text)
                 if not text.endswith("\n"):
@@ -166,15 +182,16 @@ class Runner:
                 self._proc.stdin.flush()
                 return {"ok": True}
             except (BrokenPipeError, OSError) as e:
-                return {"ok": False, "error": f"Erreur d'écriture stdin: {e}"}
+                return {"ok": False,
+                        "error": "Erreur d'ecriture stdin: {0}".format(e)}
 
-    def stop(self) -> dict:
+    def stop(self):
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 return {"ok": True, "message": "Aucun processus en cours."}
             pid = self._proc.pid
             argv = self._argv
-        # Kill the whole process group so child binaries spawned via sudo die too.
+        # Kill the whole process group so children of sudo die too.
         killed = False
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
@@ -182,22 +199,21 @@ class Runner:
         except ProcessLookupError:
             killed = True
         except PermissionError:
-            # sudo elevated the child; ask sudo to kill it.
             if argv and argv[0] == "sudo":
                 try:
                     subprocess.run(
                         ["sudo", "-n", "kill", "-TERM", str(pid)],
-                        check=False, timeout=5)
+                        timeout=5)
                     killed = True
                 except Exception:
                     pass
         if not killed:
-            return {"ok": False, "error": "Impossible de terminer le processus."}
+            return {"ok": False,
+                    "error": "Impossible de terminer le processus."}
         for _ in range(30):
             if self._proc is None or self._proc.poll() is not None:
                 break
             time.sleep(0.1)
-        # Force kill if still alive.
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 try:
@@ -207,8 +223,9 @@ class Runner:
                 if argv and argv[0] == "sudo":
                     try:
                         subprocess.run(
-                            ["sudo", "-n", "kill", "-KILL", str(self._proc.pid)],
-                            check=False, timeout=5)
+                            ["sudo", "-n", "kill", "-KILL",
+                             str(self._proc.pid)],
+                            timeout=5)
                     except Exception:
                         pass
         return {"ok": True}
@@ -220,7 +237,7 @@ class Runner:
 COLOR_RE = re.compile(r"^\d{1,3},\d{1,3},\d{1,3}$")
 
 
-def _coerce(opt: dict, raw_value):
+def _coerce(opt, raw_value):
     t = opt["type"]
     if t == "bool":
         return bool(raw_value)
@@ -232,42 +249,42 @@ def _coerce(opt: dict, raw_value):
         return float(raw_value)
     if t == "color":
         if not COLOR_RE.match(str(raw_value)):
-            raise ValueError(f"Couleur invalide pour {opt['name']}: {raw_value!r}")
-        # Sanity check 0..255 per channel.
+            raise ValueError(
+                "Couleur invalide pour {0}: {1!r}".format(
+                    opt["name"], raw_value))
         for chan in str(raw_value).split(","):
             n = int(chan)
             if not (0 <= n <= 255):
-                raise ValueError(f"Couleur hors plage pour {opt['name']}: {raw_value!r}")
+                raise ValueError(
+                    "Couleur hors plage pour {0}: {1!r}".format(
+                        opt["name"], raw_value))
         return str(raw_value)
     return str(raw_value)
 
 
-def _file_ok(opt: dict, raw_value: str) -> str:
+def _file_ok(opt, raw_value):
     """Validate that a file value resolves inside one of the allowed dirs."""
     if raw_value in (None, ""):
         return ""
-    # Normalize and make absolute relative to repo root if needed.
     candidate = raw_value
-    abs_path = os.path.abspath(
-        os.path.join(REPO_ROOT, candidate)
-        if not os.path.isabs(candidate) else candidate)
+    if os.path.isabs(candidate):
+        abs_path = os.path.abspath(candidate)
+    else:
+        abs_path = os.path.abspath(os.path.join(REPO_ROOT, candidate))
     allowed = []
     for d in opt.get("dirs", []):
         allowed.append(os.path.abspath(os.path.join(REPO_ROOT, d)))
     for root in allowed:
         if abs_path == root or abs_path.startswith(root + os.sep):
             if not os.path.isfile(abs_path):
-                raise ValueError(f"Fichier introuvable: {raw_value}")
+                raise ValueError(
+                    "Fichier introuvable: {0}".format(raw_value))
             return os.path.relpath(abs_path, REPO_ROOT)
-    raise ValueError(f"Chemin de fichier non autorisé: {raw_value}")
+    raise ValueError("Chemin de fichier non autorise: {0}".format(raw_value))
 
 
-def build_argv(program: dict, values: dict) -> tuple[list[str], str | None]:
-    """Return (argv, stdin_text).
-
-    argv starts with the binary path. Common LED options come first, then
-    program-specific options (with flags), then any positional values.
-    """
+def build_argv(program, values):
+    """Return (argv, stdin_text). argv starts with the binary path."""
     binary = os.path.join(REPO_ROOT, program["binary"])
     argv = [binary]
     positional_values = {}
@@ -302,7 +319,6 @@ def build_argv(program: dict, values: dict) -> tuple[list[str], str | None]:
         if opt["type"] == "file":
             value = _file_ok(opt, raw or opt.get("default", ""))
         elif name == "format" and program["id"] == "clock":
-            # Multiple -d allowed; split on "|".
             if raw is None or raw == "":
                 value = None
             else:
@@ -314,7 +330,7 @@ def build_argv(program: dict, values: dict) -> tuple[list[str], str | None]:
         else:
             value = _coerce(opt, raw)
         if opt.get("required") and (value is None or value == ""):
-            raise ValueError(f"Option requise: {name}")
+            raise ValueError("Option requise: {0}".format(name))
         if name in positional_names:
             positional_values[name] = value
         else:
@@ -331,7 +347,7 @@ def build_argv(program: dict, values: dict) -> tuple[list[str], str | None]:
 # --- File helpers ----------------------------------------------------------
 
 
-def list_files(opt: dict) -> list[str]:
+def list_files(opt):
     out = []
     for d in opt.get("dirs", []):
         root = os.path.abspath(os.path.join(REPO_ROOT, d))
@@ -353,12 +369,13 @@ def list_files(opt: dict) -> list[str]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    runner: Runner  # set on class
+    runner = None  # type: Runner  (set on class before serving)
 
     server_version = "rpi-rgb-led-matrix-web/1.0"
 
-    def log_message(self, fmt, *args):  # quiet
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+    def log_message(self, fmt, *args):
+        sys.stderr.write(
+            "[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
     # ---- helpers ----
     def _send_json(self, obj, status=200):
@@ -370,7 +387,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_file(self, path: str, content_type: str):
+    def _send_file(self, path, content_type):
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -384,7 +401,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _read_body(self) -> bytes:
+    def _read_body(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         return self.rfile.read(length) if length else b""
 
@@ -438,8 +455,10 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(url.query)
             since = int((qs.get("since") or ["0"])[0])
             total, lines = Handler.runner.get_log_since(since)
-            self._send_json({"seq": total, "lines": lines,
-                             "status": Handler.runner.status()})
+            self._send_json({
+                "seq": total, "lines": lines,
+                "status": Handler.runner.status(),
+            })
             return
         self.send_error(404, "Not Found")
 
@@ -453,14 +472,16 @@ class Handler(BaseHTTPRequestHandler):
                 values = data.get("values") or {}
                 prog = get_program(program_id)
                 if prog is None:
-                    self._send_json({"ok": False,
-                                     "error": f"Programme inconnu: {program_id}"},
-                                    status=400)
+                    self._send_json(
+                        {"ok": False,
+                         "error": "Programme inconnu: {0}".format(program_id)},
+                        status=400)
                     return
                 try:
                     argv, stdin_text = build_argv(prog, values)
                 except ValueError as e:
-                    self._send_json({"ok": False, "error": str(e)}, status=400)
+                    self._send_json({"ok": False, "error": str(e)},
+                                    status=400)
                     return
                 res = Handler.runner.start(prog, argv, stdin_text=stdin_text)
                 if not res.get("ok"):
@@ -481,8 +502,9 @@ class Handler(BaseHTTPRequestHandler):
                 program_id = data.get("program_id") or ""
                 prog = get_program(program_id)
                 if prog is None:
-                    self._send_json({"ok": False, "error": "Programme inconnu"},
-                                    status=400)
+                    self._send_json(
+                        {"ok": False, "error": "Programme inconnu"},
+                        status=400)
                     return
                 build_dir = os.path.join(REPO_ROOT, prog.get("build_dir", "."))
                 target = prog.get("build_target", "")
@@ -490,24 +512,30 @@ class Handler(BaseHTTPRequestHandler):
                 if target:
                     cmd.append(target)
                 try:
-                    cp = subprocess.run(cmd, cwd=build_dir,
-                                        capture_output=True, text=True,
-                                        timeout=600)
+                    cp = subprocess.run(
+                        cmd, cwd=build_dir,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        universal_newlines=True, timeout=600)
                 except FileNotFoundError:
-                    self._send_json({"ok": False,
-                                     "error": "make introuvable"}, status=500)
+                    self._send_json(
+                        {"ok": False, "error": "make introuvable"},
+                        status=500)
                     return
                 output = (cp.stdout or "") + (cp.stderr or "")
-                self._send_json({"ok": cp.returncode == 0,
-                                 "returncode": cp.returncode,
-                                 "output": output})
+                self._send_json({
+                    "ok": cp.returncode == 0,
+                    "returncode": cp.returncode,
+                    "output": output,
+                })
                 return
             if path == "/api/upload":
                 self._handle_upload()
                 return
         except Exception as e:
-            self._send_json({"ok": False, "error": f"{type(e).__name__}: {e}"},
-                            status=500)
+            self._send_json(
+                {"ok": False,
+                 "error": "{0}: {1}".format(type(e).__name__, e)},
+                status=500)
             return
         self.send_error(404, "Not Found")
 
@@ -516,8 +544,9 @@ class Handler(BaseHTTPRequestHandler):
         ctype = self.headers.get("Content-Type", "")
         m = re.match(r"multipart/form-data;\s*boundary=(.+)", ctype, re.I)
         if not m:
-            self._send_json({"ok": False, "error": "multipart/form-data attendu"},
-                            status=400)
+            self._send_json(
+                {"ok": False, "error": "multipart/form-data attendu"},
+                status=400)
             return
         boundary = ("--" + m.group(1)).encode()
         body = self._read_body()
@@ -532,7 +561,6 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             headers_blob = part[:header_end].decode("utf-8", errors="replace")
             content = part[header_end + 4:]
-            # Strip trailing CRLF.
             if content.endswith(b"\r\n"):
                 content = content[:-2]
             fname_match = re.search(
@@ -542,9 +570,9 @@ class Handler(BaseHTTPRequestHandler):
             filename = os.path.basename(fname_match.group(1))
             if not filename:
                 continue
-            # Sanitize: keep only safe chars.
             filename = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
-            os.makedirs(UPLOAD_DIR, exist_ok=True)
+            if not os.path.isdir(UPLOAD_DIR):
+                os.makedirs(UPLOAD_DIR)
             target = os.path.join(UPLOAD_DIR, filename)
             with open(target, "wb") as f:
                 f.write(content)
@@ -557,17 +585,20 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0)")
-    ap.add_argument("--port", type=int, default=8080, help="Port (default 8080)")
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="Bind address (default 0.0.0.0)")
+    ap.add_argument("--port", type=int, default=8080,
+                    help="Port (default 8080)")
     ap.add_argument("--no-sudo", action="store_true",
-                    help="Do not prefix binaries with sudo (useful for testing)")
+                    help="Do not prefix binaries with sudo (testing)")
     args = ap.parse_args()
 
     Handler.runner = Runner(use_sudo=not args.no_sudo)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"rpi-rgb-led-matrix web UI listening on http://{args.host}:{args.port}/")
-    print(f"  repo root: {REPO_ROOT}")
-    print(f"  sudo:      {'no' if args.no_sudo else 'yes'}")
+    print("rpi-rgb-led-matrix web UI listening on http://{0}:{1}/".format(
+        args.host, args.port))
+    print("  repo root: {0}".format(REPO_ROOT))
+    print("  sudo:      {0}".format("no" if args.no_sudo else "yes"))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
